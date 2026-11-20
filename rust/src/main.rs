@@ -2,7 +2,9 @@
 
 pub mod git;
 pub mod githttp;
+pub mod graphql;
 pub mod http;
+pub mod mcp;
 pub mod rest;
 pub mod store;
 
@@ -517,6 +519,39 @@ fn main() {
     router.register("POST", "/:owner/:repo.git/git-receive-pack", {
         let forge = Arc::clone(&forge);
         move |request, captures| git_route(&forge, request, captures, "git-receive-pack")
+    });
+    router.register("POST", "/mcp", {
+        let forge = Arc::clone(&forge);
+        let token = forge.lock().expect("forge mutex poisoned").token.clone();
+        move |request, _captures| match authorize(request, token.as_deref()) {
+            Ok(()) => {
+                let host = request.headers.get("host").map(String::as_str).unwrap_or("127.0.0.1");
+                mcp::handle(&mut forge.lock().expect("forge mutex poisoned"), request, &format!("http://{host}"))
+            }
+            Err("missing") => {
+                let mut response = http::Response::json_error(401, "Requires authentication");
+                response.extra.push(("www-authenticate".to_string(), "Bearer realm=\"gitforge\"".to_string()));
+                response
+            }
+            _ => {
+                let mut response = http::Response::json_error(401, "Bad credentials");
+                response.extra.push(("www-authenticate".to_string(), "Bearer realm=\"gitforge\"".to_string()));
+                response
+            }
+        }
+    });
+    router.register("POST", "/api/graphql", {
+        let forge = Arc::clone(&forge);
+        let token = forge.lock().expect("forge mutex poisoned").token.clone();
+        move |request, _captures| match authorize(request, token.as_deref()) {
+            Ok(()) => {
+                let host = request.headers.get("host").map(String::as_str).unwrap_or("127.0.0.1");
+                let origin = format!("http://{host}");
+                graphql::handle(&mut forge.lock().expect("forge mutex poisoned"), request, &origin)
+            }
+            Err("missing") => http::Response::json_error(401, "Requires authentication"),
+            _ => http::Response::json_error(401, "Bad credentials"),
+        }
     });
     let router = Arc::new(router);
 
