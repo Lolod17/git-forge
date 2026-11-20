@@ -1,5 +1,8 @@
+#![recursion_limit = "256"]
+
 pub mod git;
 pub mod http;
+pub mod rest;
 pub mod store;
 
 use std::env;
@@ -375,12 +378,13 @@ fn main() {
         .ok()
         .filter(|value| !value.is_empty());
     let forge = store::Forge::new(login, token);
+    let forge = Arc::new(std::sync::Mutex::new(forge));
     let mut router = http::Router::new();
     router.register("GET", "/healthz", |_request, _captures| {
         http::Response::send_json(200, "{\"ok\":true}")
     });
     router.register("GET", "/api/v3", {
-        let token = forge.token.clone();
+        let token = forge.lock().expect("forge mutex poisoned").token.clone();
         move |request, _captures| match authorize(request, token.as_deref()) {
             Ok(()) => root_response(request),
             Err("missing") => {
@@ -407,6 +411,34 @@ fn main() {
             }
         }
     });
+    for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+        router.register(method, "/api/v3/*path", {
+            let forge = Arc::clone(&forge);
+            let token = forge.lock().expect("forge mutex poisoned").token.clone();
+            move |request, captures| match authorize(request, token.as_deref()) {
+                Ok(()) => {
+                    let path = captures.first().map(String::as_str).unwrap_or("");
+                    let host = request.headers.get("host").map(String::as_str).unwrap_or("127.0.0.1");
+                    let origin = format!("http://{host}");
+                    let mut result = rest::handle(&mut forge.lock().expect("forge mutex poisoned"), request, path, &origin);
+                    if request.method == "HEAD" { result.body.clear(); }
+                    result
+                }
+                Err("missing") => {
+                    let mut response = http::Response::json_error(401, "Requires authentication");
+                    response.extra.push(("www-authenticate".to_string(), "Bearer realm=\"gitforge\"".to_string()));
+                    response.extra.push(("x-oauth-scopes".to_string(), "repo, read:org".to_string()));
+                    response
+                }
+                _ => {
+                    let mut response = http::Response::json_error(401, "Bad credentials");
+                    response.extra.push(("www-authenticate".to_string(), "Bearer realm=\"gitforge\"".to_string()));
+                    response.extra.push(("x-oauth-scopes".to_string(), "repo, read:org".to_string()));
+                    response
+                }
+            }
+        });
+    }
     let router = Arc::new(router);
 
     let server_router = Arc::clone(&router);

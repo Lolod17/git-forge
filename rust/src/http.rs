@@ -99,12 +99,16 @@ fn route_segments(path: &str) -> Vec<String> {
 }
 
 fn match_route(pattern: &[String], path: &[String]) -> Option<Vec<String>> {
-    if pattern.len() != path.len() {
+    let mut captures = Vec::new();
+    let wildcard = pattern.last().and_then(|part| part.strip_prefix('*'));
+    let fixed_len = if wildcard.is_some() { pattern.len().saturating_sub(1) } else { pattern.len() };
+    if (wildcard.is_none() && pattern.len() != path.len()) || path.len() < fixed_len {
         return None;
     }
-    let mut captures = Vec::new();
-    for (expected, actual) in pattern.iter().zip(path) {
-        if let Some(name) = expected.strip_prefix(':') {
+    for (expected, actual) in pattern[..fixed_len].iter().zip(path.iter()) {
+        if expected.starts_with('*') {
+            return None;
+        } else if let Some(name) = expected.strip_prefix(':') {
             if name.is_empty() || actual.is_empty() {
                 return None;
             }
@@ -112,6 +116,10 @@ fn match_route(pattern: &[String], path: &[String]) -> Option<Vec<String>> {
         } else if expected != actual {
             return None;
         }
+    }
+    if wildcard.is_some() {
+        if wildcard == Some("") || path.len() == fixed_len { return None; }
+        captures.push(path[fixed_len..].join("/"));
     }
     Some(captures)
 }

@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const REQUEST_TIMEOUT_MS = 30_000;
+/** How long the native binary has to report itself registered before the TS server takes over. */
+const NATIVE_BOOT_TIMEOUT_MS = 8_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 2_000;
 
@@ -62,7 +64,7 @@ function runNative() {
       if (registered) return;
       process.stderr.write('[entry] native server did not register within 30 seconds; falling back to TypeScript\n');
       child.kill('SIGKILL');
-    }, 30_000);
+    }, NATIVE_BOOT_TIMEOUT_MS);
 
     child.on('error', (err) => {
       process.stderr.write(`[entry] could not start native server: ${err.message}\n`);
