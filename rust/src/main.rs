@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod git;
+pub mod githttp;
 pub mod http;
 pub mod rest;
 pub mod store;
@@ -302,6 +303,68 @@ fn authorize(request: &http::Request, token: Option<&str>) -> Result<(), &'stati
     Ok(())
 }
 
+fn git_route(
+    forge: &Arc<std::sync::Mutex<store::Forge>>,
+    request: &http::Request,
+    captures: &[String],
+    action: &str,
+) -> http::Response {
+    let mut forge = forge.lock().expect("forge mutex poisoned");
+    match authorize(request, forge.token.as_deref()) {
+        Ok(()) => {}
+        Err("missing") => return githttp::auth_error("Authentication required"),
+        _ => return githttp::auth_error("Bad credentials"),
+    }
+    let Some(owner) = captures.first() else {
+        return githttp::missing_repo();
+    };
+    let Some(repo_segment) = captures.get(1) else {
+        return githttp::missing_repo();
+    };
+    let Some(repo_name) = repo_segment.strip_suffix(".git") else {
+        return githttp::missing_repo();
+    };
+    let Some(mut repo) = forge.repo_by_name(owner, repo_name) else {
+        return githttp::missing_repo();
+    };
+    let result = match action {
+        "info/refs" => {
+            let service = request
+                .query
+                .iter()
+                .find(|(key, _)| key == "service")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("");
+            githttp::info_refs(
+                &forge,
+                &repo,
+                service,
+                githttp::request_git_protocol(request),
+            )
+        }
+        "git-upload-pack" => githttp::upload_pack(
+            &forge,
+            &mut repo,
+            &request.body,
+            githttp::request_git_protocol(request),
+        ),
+        "git-receive-pack" => githttp::receive_pack(&mut forge, &mut repo, &request.body),
+        _ => {
+            let mut response = http::Response::send_json(405, "{\"message\":\"Method Not Allowed\"}");
+            response.content_type = "text/plain; charset=utf-8".to_string();
+            response.body = b"Method Not Allowed\n".to_vec();
+            response
+        }
+    };
+    if request.method == "HEAD" {
+        let mut result = result;
+        result.body.clear();
+        result
+    } else {
+        result
+    }
+}
+
 fn decode_base64(value: &str) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     let mut accumulator = 0u32;
@@ -361,6 +424,7 @@ fn main() {
         }
     };
     println!("[forge] bound {port}");
+    eprintln!("[forge] bound {port}");
     let _ = std::io::stdout().flush();
 
     if !register(&address, port) {
@@ -368,6 +432,7 @@ fn main() {
         std::process::exit(1);
     }
     println!("[forge] registered");
+    eprintln!("[forge] registered");
     let _ = std::io::stdout().flush();
 
     let login = env::var("FORGE_LOGIN")
@@ -439,6 +504,20 @@ fn main() {
             }
         });
     }
+    for method in ["GET", "HEAD"] {
+        router.register(method, "/:owner/:repo.git/info/refs", {
+            let forge = Arc::clone(&forge);
+            move |request, captures| git_route(&forge, request, captures, "info/refs")
+        });
+    }
+    router.register("POST", "/:owner/:repo.git/git-upload-pack", {
+        let forge = Arc::clone(&forge);
+        move |request, captures| git_route(&forge, request, captures, "git-upload-pack")
+    });
+    router.register("POST", "/:owner/:repo.git/git-receive-pack", {
+        let forge = Arc::clone(&forge);
+        move |request, captures| git_route(&forge, request, captures, "git-receive-pack")
+    });
     let router = Arc::new(router);
 
     let server_router = Arc::clone(&router);
