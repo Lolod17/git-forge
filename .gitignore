@@ -1,2 +1,3 @@
 bin/forge-darwin-arm64
 rust/target/
+rust/vendor/
