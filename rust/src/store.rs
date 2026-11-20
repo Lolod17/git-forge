@@ -121,6 +121,8 @@ pub struct Repo {
     pub labels: HashMap<String, Label>,
     pub deleted: bool,
     pub pack_cache: HashMap<String, Vec<u8>>,
+    /// Packs already built for a fetch plan, shared by concurrent clones.
+    pub served_packs: HashMap<String, std::sync::Arc<Vec<u8>>>,
 }
 
 impl Repo {
@@ -144,6 +146,7 @@ impl Repo {
             labels: HashMap::new(),
             deleted: false,
             pack_cache: HashMap::new(),
+            served_packs: HashMap::new(),
         }
     }
 

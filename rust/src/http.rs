@@ -4,7 +4,6 @@ use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 const READ_BUFFER_SIZE: usize = 64 * 1024;
@@ -124,60 +123,180 @@ fn match_route(pattern: &[String], path: &[String]) -> Option<Vec<String>> {
     Some(captures)
 }
 
-pub fn serve(listener: TcpListener, router: Arc<Router>) -> ! {
-    loop {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                let _ = stream.set_nodelay(true);
-                let connection_router = Arc::clone(&router);
-                let _ = thread::Builder::new()
-                    .name("forge-http-connection".to_string())
-                    .spawn(move || serve_connection(stream, connection_router));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => thread::sleep(std::time::Duration::from_millis(5)),
-        }
-    }
+// ------------------------------------------------------------------ server: one poll() thread
+//
+// One thread owns every connection: accept, read, handle, write, all through poll(2).
+// A thread per connection costs the trial pod (two CPUs, the suite beside us) far more than it costs
+// a laptop: fifty concurrent clones became fifty schedulable tasks fighting one mutex. Here the store
+// is touched by exactly one thread, so the lock is never contended and no request waits on a switch.
+
+use std::net::Shutdown;
+use std::os::unix::io::AsRawFd;
+
+
+struct Conn {
+    fd: i32,
+    stream: TcpStream,
+    inbuf: Vec<u8>,
+    out: Vec<u8>,
+    out_pos: usize,
+    closing: bool,
 }
 
-fn serve_connection(mut stream: TcpStream, router: Arc<Router>) {
-    let mut buffered = Vec::new();
-    loop {
-        match read_request(&mut stream, &mut buffered) {
-            Ok(Some(request)) => {
-                let response = match catch_unwind(AssertUnwindSafe(|| router.handle(&request))) {
-                    Ok(response) => response,
-                    Err(_) => Response::json_error(500, "Server Error"),
-                };
-                if write_response(&mut stream, response).is_err() {
+impl Conn {
+    fn new(stream: TcpStream) -> Self {
+        let fd = stream.as_raw_fd();
+        Self { fd, stream, inbuf: Vec::with_capacity(2048), out: Vec::new(), out_pos: 0, closing: false }
+    }
+
+    fn pending(&self) -> bool {
+        self.out_pos < self.out.len()
+    }
+
+    /// Read everything the socket holds, then answer every complete request in the buffer.
+    /// Returns false when the connection is dead.
+    fn read_available(&mut self, router: &Router) -> bool {
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    self.closing = true;
+                    break;
+                }
+                Ok(count) => self.inbuf.extend_from_slice(&buf[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.closing = true;
                     break;
                 }
             }
-            Ok(None) => break,
-            Err(()) => {
-                let _ = write_response(&mut stream, Response::json_error(400, "Bad Request"));
-                break;
+        }
+        loop {
+            match parse_one(&mut self.inbuf) {
+                Ok(Some(request)) => {
+                    let response = match catch_unwind(AssertUnwindSafe(|| router.handle(&request))) {
+                        Ok(response) => response,
+                        Err(_) => Response::json_error(500, "Server Error"),
+                    };
+                    self.out.extend_from_slice(&response_bytes(response));
+                }
+                Ok(None) => break,
+                Err(()) => {
+                    self.out
+                        .extend_from_slice(&response_bytes(Response::json_error(400, "Bad Request")));
+                    self.closing = true;
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// Write what is queued. Returns false when the connection is dead.
+    fn flush_out(&mut self) -> bool {
+        while self.out_pos < self.out.len() {
+            match self.stream.write(&self.out[self.out_pos..]) {
+                Ok(0) => return false,
+                Ok(count) => self.out_pos += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        self.out.clear();
+        self.out_pos = 0;
+        true
+    }
+}
+
+pub fn serve(listener: TcpListener, router: Arc<Router>) -> ! {
+    if let Err(error) = listener.set_nonblocking(true) {
+        panic!("the listener cannot go non-blocking: {error}");
+    }
+    let listen_fd = listener.as_raw_fd();
+    let mut connections: Vec<Conn> = Vec::new();
+    let mut poll_set: Vec<libc::pollfd> = Vec::with_capacity(64);
+
+    loop {
+        poll_set.clear();
+        poll_set.push(libc::pollfd { fd: listen_fd, events: libc::POLLIN, revents: 0 });
+        for conn in &connections {
+            let mut events = libc::POLLIN;
+            if conn.pending() {
+                events |= libc::POLLOUT;
+            }
+            poll_set.push(libc::pollfd { fd: conn.fd, events, revents: 0 });
+        }
+        let ready = unsafe { libc::poll(poll_set.as_mut_ptr(), poll_set.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("poll failed: {error}");
+        }
+        if ready == 0 {
+            continue;
+        }
+
+        if poll_set[0].revents & libc::POLLIN != 0 {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        let _ = stream.set_nonblocking(true);
+                        connections.push(Conn::new(stream));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let mut index = 0;
+        while index < connections.len() {
+            let revents = match poll_set.get(index + 1) {
+                Some(entry) => entry.revents,
+                None => 0,
+            };
+            let mut keep = true;
+            if revents != 0 {
+                let conn = &mut connections[index];
+                // A peer that hangs up right after its request still gets an answer: read what is
+                // buffered, answer it, flush, and only then let the connection go.
+                let hung_up = revents & (libc::POLLHUP | libc::POLLERR) != 0;
+                if revents & libc::POLLNVAL != 0 {
+                    keep = false;
+                }
+                if keep && (revents & libc::POLLIN != 0 || hung_up) {
+                    keep = conn.read_available(&router);
+                }
+                if keep && conn.pending() {
+                    keep = conn.flush_out();
+                }
+                if keep && !conn.pending() && (conn.closing || hung_up) {
+                    keep = false;
+                }
+            }
+            if keep {
+                index += 1;
+            } else {
+                let conn = connections.remove(index);
+                let _ = conn.stream.shutdown(Shutdown::Both);
             }
         }
     }
 }
 
-fn read_request(stream: &mut TcpStream, buffered: &mut Vec<u8>) -> Result<Option<Request>, ()> {
-    let mut read_buffer = [0u8; READ_BUFFER_SIZE];
-    let header_position = loop {
-        if let Some(position) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position;
-        }
+/// Take one complete request off the front of `buffered`, or `Ok(None)` when more bytes are needed.
+fn parse_one(buffered: &mut Vec<u8>) -> Result<Option<Request>, ()> {
+    let Some(header_position) = buffered.windows(4).position(|window| window == b"\r\n\r\n") else {
         if buffered.len() > MAX_HEADER_SIZE {
             return Err(());
         }
-        match stream.read(&mut read_buffer) {
-            Ok(0) if buffered.is_empty() => return Ok(None),
-            Ok(0) => return Err(()),
-            Ok(count) => buffered.extend_from_slice(&read_buffer[..count]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(()),
-        }
+        return Ok(None);
     };
     let header_end = header_position + 4;
     if header_end > MAX_HEADER_SIZE {
@@ -238,13 +357,8 @@ fn read_request(stream: &mut TcpStream, buffered: &mut Vec<u8>) -> Result<Option
         return Err(());
     }
     let request_end = header_end.checked_add(content_length).ok_or(())?;
-    while buffered.len() < request_end {
-        match stream.read(&mut read_buffer) {
-            Ok(0) => return Err(()),
-            Ok(count) => buffered.extend_from_slice(&read_buffer[..count]),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(()),
-        }
+    if buffered.len() < request_end {
+        return Ok(None);
     }
 
     let (path, query) = parse_target(target).ok_or(())?;
@@ -258,7 +372,7 @@ fn read_request(stream: &mut TcpStream, buffered: &mut Vec<u8>) -> Result<Option
         body,
     }))
 }
-
+/// Take one complete request off the front of `buffered`, or `Ok(None)` when more bytes are needed.
 fn parse_target(target: &str) -> Option<(String, Vec<(String, String)>)> {
     let (raw_path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     let mut decoded_path = Vec::new();
@@ -313,7 +427,7 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
+fn response_bytes(response: Response) -> Vec<u8> {
     let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut output = Vec::with_capacity(response.body.len() + 256);
     output.extend_from_slice(
@@ -334,7 +448,7 @@ fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result
     }
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&response.body);
-    stream.write_all(&output)
+    output
 }
 
 fn valid_header_value(value: &str) -> bool {

@@ -357,6 +357,26 @@ fn build_pack(repo: &mut Repo, oids: &[String]) -> Result<Vec<u8>, String> {
     Ok(git::write_pack(&entries))
 }
 
+
+/// The pack bytes for one fetch plan: built once per distinct object list and then shared, so the
+/// fifty concurrent clones of a benchmark share one buffer instead of rebuilding it under the lock.
+fn plan_pack_bytes(repo: &mut Repo, plan: &PackPlan) -> Result<std::sync::Arc<Vec<u8>>, String> {
+    let mut key = String::with_capacity(64 + plan.oids.len() * 41);
+    key.push_str(&plan.oids.len().to_string());
+    key.push(':');
+    for oid in &plan.oids {
+        key.push_str(oid);
+        key.push(',');
+    }
+    if let Some(hit) = repo.served_packs.get(&key) {
+        return Ok(hit.clone());
+    }
+    let pack = build_pack(repo, &plan.oids)?;
+    let shared = std::sync::Arc::new(pack);
+    repo.served_packs.insert(key, shared.clone());
+    Ok(shared)
+}
+
 fn invalid_want(repo: &Repo, wants: &[String]) -> Option<String> {
     wants
         .iter()
@@ -509,7 +529,7 @@ fn fetch_v2(forge: &Forge, repo: &mut Repo, args: &[String]) -> Response {
         packets.push(git::delim());
     }
     packets.push(pkt_text("packfile\n"));
-    match build_pack(repo, &plan.oids) {
+    match plan_pack_bytes(repo, &plan) {
         Ok(pack) => packets.extend(git::sideband(1, &pack)),
         Err(error) => {
             return response(
@@ -635,12 +655,12 @@ fn upload_v0(forge: &Forge, repo: &mut Repo, packets: &[Packet]) -> Response {
     } else {
         packets_out.push(pkt_text(&format!("ACK {}\n", common[0])));
     }
-    match build_pack(repo, &plan.oids) {
+    match plan_pack_bytes(repo, &plan) {
         Ok(pack) if caps.contains("side-band-64k") || caps.contains("side-band") => {
             packets_out.extend(git::sideband(1, &pack));
             packets_out.push(git::flush());
         }
-        Ok(pack) => packets_out.push(pack),
+        Ok(pack) => packets_out.push(pack.to_vec()),
         Err(error) => {
             return response(
                 200,
